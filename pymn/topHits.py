@@ -38,8 +38,8 @@ def topHits(
         cnv.index == cnv.columns
     ), "cell_nv is does not have the same order in both the rows and columns"
 
-    hit_matrix_melted = cnv.melt(ignore_index=False, value_name = "auroc", var_name = "target_cell_type").reset_index()
-    hit_matrix_melted = hit_matrix_melted.rename(columns={'index':'ref_cell_type'})
+    hit_matrix_melted = cnv.melt(ignore_index=False, value_name = "auroc", var_name = "ref_cell_type").reset_index()
+    hit_matrix_melted = hit_matrix_melted.rename(columns={'index':'target_cell_type'})
     
     #could be sped up by doing this while it's a matrix
     hit_matrix_melted["ref_study"] = hit_matrix_melted["ref_cell_type"].str.replace("[|].*","",regex=True)
