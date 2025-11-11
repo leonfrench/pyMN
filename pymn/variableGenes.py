@@ -21,11 +21,11 @@ def compute_var_genes(adata, return_vect=True):
 
     if sparse.issparse(adata.X):
         median = csc_median_axis_0(sparse.csc_matrix(adata.X))
-        variance = np.var(adata.X.A, axis=0)
+        variance = sparse_var_axis0(adata.X)
     else:
         median = bottleneck.median(adata.X, axis=0)
         variance = np.var(adata.X,axis=0)
-    bins = np.quantile(median, q=np.linspace(0, 1, 11), interpolation="midpoint")
+    bins = np.quantile(median, q=np.linspace(0, 1, 11), method="midpoint")
     digits = np.digitize(median, bins, right=True)
 
     selected_genes = np.zeros_like(digits)
@@ -60,7 +60,8 @@ def variableGenes(adata, study_col, return_vect=False):
         np.ndarray -- None if saving in adata.var['highly_variable'], array of booleans if returning of length ngenes
     """
 
-    assert study_col in adata.obs_keys(), "Study Col not in obs data"
+    assert study_col in adata.obs.columns, f"Study col '{study_col}' not in adata.obs"
+
 
     studies = np.unique(adata.obs[study_col])
     genes = adata.var_names
@@ -133,3 +134,30 @@ def csc_median_axis_0(X):
         median[f_ind] = _get_median(data, nz)
 
     return median
+
+def sparse_var_axis0(X):
+    """
+    Compute variance across axis=0 (per gene) for sparse CSR/CSC matrix.
+    Equivalent to np.var(X.toarray(), axis=0) but memory-efficient.
+    """
+    if not sparse.issparse(X):
+        return np.var(X, axis=0)
+
+    # Ensure CSR format for efficient row slicing
+    X = sparse.csr_matrix(X)
+
+    n = X.shape[0]  # number of cells
+    if n <= 1:
+        return np.zeros(X.shape[1])
+
+    # Mean = (sum of values) / n
+    sum_x = np.array(X.sum(axis=0)).ravel()  # shape: (n_genes,)
+    mean_x = sum_x / n
+
+    # E[X^2] = sum(x_ij^2) / n
+    sum_x2 = np.array((X.multiply(X)).sum(axis=0)).ravel()
+    mean_x2 = sum_x2 / n
+
+    # Var(X) = E[X^2] - (E[X])^2
+    var_x = mean_x2 - mean_x ** 2
+    return var_x
