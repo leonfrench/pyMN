@@ -9,11 +9,16 @@ from .utils import format_bytes, numerical_thread_summary
 
 def _select_genes_from_statistics(median, variance):
     """Select genes from per-gene median and variance vectors."""
-    # ``interpolation`` retains compatibility with the NumPy 1.21 environment
-    # used by the baseline as well as newer NumPy releases.
-    bins = np.quantile(median,
-                       q=np.linspace(0, 1, 11),
-                       interpolation="midpoint")
+    quantiles = np.linspace(0, 1, 11)
+    try:
+        # NumPy >= 1.22 renamed ``interpolation`` to ``method`` and recent
+        # releases no longer accept the old keyword.
+        bins = np.quantile(median, q=quantiles, method="midpoint")
+    except TypeError:
+        # NumPy 1.21 and older accept only ``interpolation``.
+        bins = np.quantile(median,
+                           q=quantiles,
+                           interpolation="midpoint")
     digits = np.digitize(median, bins, right=True)
 
     selected_genes = np.zeros_like(digits)
