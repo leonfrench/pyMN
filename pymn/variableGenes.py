@@ -2,6 +2,7 @@ import numpy as np
 import bottleneck
 from scipy import sparse
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .utils import format_bytes, numerical_thread_summary
 
@@ -54,33 +55,75 @@ def compute_var_genes(adata, return_vect=True):
         adata.var["highly_variable"] = selected_genes
 
 
-def compute_var_genes_batched(X, row_indices, gene_batch_size=1024):
+def _compute_gene_statistics_block(X, row_indices, start, stop):
+    """Compute median and variance for one independent gene block."""
+    if sparse.issparse(X):
+        block = X[row_indices, start:stop]
+        median = csc_median_axis_0(sparse.csc_matrix(block))
+        variance = sparse_var_axis0(block)
+    else:
+        block = np.asarray(X[np.ix_(row_indices, np.arange(start, stop))])
+        median = bottleneck.median(block, axis=0)
+        variance = np.var(block, axis=0)
+    return start, stop, median, variance
+
+
+def compute_var_genes_batched(X,
+                              row_indices,
+                              gene_batch_size=1024,
+                              n_jobs=1):
     """Compute variable genes while bounding temporary data by gene batches.
 
     Unlike ``compute_var_genes``, this helper never constructs an AnnData view
     containing every gene for a study. Sparse row subsets are materialized only
     for the current gene batch.
     """
+    if not isinstance(gene_batch_size, (int, np.integer)):
+        raise TypeError("gene_batch_size must be an integer")
     if gene_batch_size <= 0:
         raise ValueError("gene_batch_size must be a positive integer")
+    if not isinstance(n_jobs, (int, np.integer)):
+        raise TypeError("n_jobs must be an integer")
+    if n_jobs <= 0:
+        raise ValueError("n_jobs must be a positive integer")
 
     row_indices = np.asarray(row_indices, dtype=np.intp)
     n_genes = X.shape[1]
     median = np.empty(n_genes, dtype=float)
     variance = np.empty(n_genes, dtype=float)
 
-    for start in range(0, n_genes, gene_batch_size):
-        stop = min(start + gene_batch_size, n_genes)
-        if sparse.issparse(X):
-            block = X[row_indices, start:stop]
-            median[start:stop] = csc_median_axis_0(
-                sparse.csc_matrix(block)
-            )
-            variance[start:stop] = sparse_var_axis0(block)
-        else:
-            block = np.asarray(X[np.ix_(row_indices, np.arange(start, stop))])
-            median[start:stop] = bottleneck.median(block, axis=0)
-            variance[start:stop] = np.var(block, axis=0)
+    blocks = [
+        (start, min(start + gene_batch_size, n_genes))
+        for start in range(0, n_genes, gene_batch_size)
+    ]
+
+    if n_jobs == 1 or len(blocks) == 1:
+        completed_blocks = (
+            _compute_gene_statistics_block(X, row_indices, start, stop)
+            for start, stop in blocks
+        )
+        for start, stop, block_median, block_variance in completed_blocks:
+            median[start:stop] = block_median
+            variance[start:stop] = block_variance
+    else:
+        worker_count = min(n_jobs, len(blocks))
+        with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="pymn-hvg") as executor:
+            futures = [
+                executor.submit(
+                    _compute_gene_statistics_block,
+                    X,
+                    row_indices,
+                    start,
+                    stop,
+                )
+                for start, stop in blocks
+            ]
+            for future in as_completed(futures):
+                start, stop, block_median, block_variance = future.result()
+                median[start:stop] = block_median
+                variance[start:stop] = block_variance
 
     return _select_genes_from_statistics(median, variance)
 
@@ -89,7 +132,8 @@ def variableGenes(adata,
                   study_col,
                   return_vect=False,
                   memory_constrained=False,
-                  gene_batch_size=1024):
+                  gene_batch_size=1024,
+                  n_jobs=1):
     """Comptue variable genes across data sets
 
     Identifies genes with high variance compared to their median expression
@@ -106,6 +150,9 @@ def variableGenes(adata,
             of materializing a full study-by-gene sparse subset (default: {False})
         gene_batch_size {int} -- Maximum number of genes materialized per study
             when memory_constrained is True (default: {1024})
+        n_jobs {int} -- Number of gene batches processed concurrently with
+            worker threads when memory_constrained is True. Peak batch memory
+            grows approximately linearly with this value (default: {1})
 
     Returns:
         np.ndarray -- None if saving in adata.var['highly_variable'], array of booleans if returning of length ngenes
@@ -116,8 +163,14 @@ def variableGenes(adata,
 
     studies = np.unique(adata.obs[study_col])
     if memory_constrained:
+        if not isinstance(gene_batch_size, (int, np.integer)):
+            raise TypeError("gene_batch_size must be an integer")
         if gene_batch_size <= 0:
             raise ValueError("gene_batch_size must be a positive integer")
+        if not isinstance(n_jobs, (int, np.integer)):
+            raise TypeError("n_jobs must be an integer")
+        if n_jobs <= 0:
+            raise ValueError("n_jobs must be a positive integer")
         var_genes = np.ones(adata.n_vars, dtype=bool)
         study_values = adata.obs[study_col].values
         study_sizes = np.asarray([
@@ -125,6 +178,8 @@ def variableGenes(adata,
         ])
         input_itemsize = np.dtype(adata.X.dtype).itemsize
         batch_genes = min(gene_batch_size, adata.n_vars)
+        gene_batch_count = int(np.ceil(adata.n_vars / gene_batch_size))
+        worker_count = min(n_jobs, gene_batch_count)
         dense_value_batch = (
             int(study_sizes.max()) * batch_genes * input_itemsize
         )
@@ -133,10 +188,13 @@ def variableGenes(adata,
             f"  cells={adata.n_obs:,}, genes={adata.n_vars:,}, "
             f"studies={len(studies):,}\n"
             f"  gene_batch_size={gene_batch_size:,}, "
+            f"n_jobs={n_jobs:,}, active_workers={worker_count:,}, "
             f"largest_study_cells={int(study_sizes.max()):,}\n"
             "  estimated_dense_value_batch="
             f"{format_bytes(dense_value_batch)} "
             "(sparse temporary storage depends on nnz)\n"
+            "  estimated_concurrent_dense_value_batches="
+            f"{format_bytes(dense_value_batch * worker_count)}\n"
             f"  cores: {numerical_thread_summary()}",
             flush=True,
         )
@@ -152,6 +210,7 @@ def variableGenes(adata,
                 adata.X,
                 row_indices,
                 gene_batch_size=gene_batch_size,
+                n_jobs=n_jobs,
             )
             var_genes &= genes_vec
         print(

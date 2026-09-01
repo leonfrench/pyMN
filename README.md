@@ -62,6 +62,7 @@ pymn.variableGenes(
     study_col="donor",
     memory_constrained=True,
     gene_batch_size=1024,
+    n_jobs=8,
 )
 
 pymn.MetaNeighborUS(
@@ -88,9 +89,9 @@ The memory-constrained path accepts categorical study and cell-type columns.
 It currently applies to de novo runs with `fast_version=True`; pretrained and
 non-fast runs continue to use the legacy implementations.
 
-When enabled, the memory-constrained functions print their batch settings,
-detected numerical thread counts, estimated working and temporary-file sizes,
-per-study progress, temporary-file cleanup, and completion time.
+When enabled, the memory-constrained functions print their batch and HVG worker
+settings, detected numerical thread counts, estimated working and temporary-file
+sizes, per-study progress, temporary-file cleanup, and completion time.
 
 The reproducible three-core HMBA benchmark, saved correctness matrices, and
 comparison command are documented in [benchmarks/README.md](./benchmarks/README.md).
