@@ -51,8 +51,8 @@ def MetaNeighbor(
     Returns:
         None/pd.DataFrame -- if save_uns is False, return dataframe of cell-type x gene set AUROCs
     """
-    assert study_col in adata.obs_keys(), "Study Col not in adata"
-    assert ct_col in adata.obs_keys(), "Cluster Col not in adata"
+    assert study_col in adata.obs.columns, "Study Col not in adata"
+    assert ct_col in adata.obs.columns, "Cluster Col not in adata"
     assert ~isinstance(
         adata.obs[study_col].values[0], float
     ), "Study Col is a floating point, must be string or int"

@@ -80,8 +80,8 @@ def MetaNeighborUS(adata,
             closely and float32 further reduces memory and disk use (default: {'float64'})
     """
 
-    assert study_col in adata.obs_keys(), "Study Col not in adata"
-    assert ct_col in adata.obs_keys(), "Cluster Col not in adata"
+    assert study_col in adata.obs.columns, "Study Col not in adata"
+    assert ct_col in adata.obs.columns, "Cluster Col not in adata"
 
     if trained_model is not None:
         var_genes = adata.var_names[np.in1d(adata.var_names,
@@ -91,8 +91,8 @@ def MetaNeighborUS(adata,
         ])
     elif type(var_genes) is str:
         assert (
-            var_genes in adata.var_keys()
-        ), f"If passing a string ({var_genes}) for var names, it must be in adata.var_keys()"
+            var_genes in adata.var.columns
+        ), f"If passing a string ({var_genes}) for var names, it must be in adata.var.columns"
         var_genes = adata.var_names[adata.var[var_genes]]
     else:
         var_genes = adata.var_names[np.in1d(adata.var_names, var_genes)]

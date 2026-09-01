@@ -23,10 +23,10 @@ def trainModel(
         pd.DataFrame -- DataFrame containing trained model, variable genes x cell types.
             Needed for running MetaNeighborUS with a pretrained model
     """
-    assert study_col in adata.obs_keys(), "Study Col not in adata"
-    assert ct_col in adata.obs_keys(), "Cluster Col not in adata"
+    assert study_col in adata.obs.columns, "Study Col not in adata"
+    assert ct_col in adata.obs.columns, "Cluster Col not in adata"
 
-    if var_genes is not "highly_variable":
+    if not (isinstance(var_genes, str) and var_genes == "highly_variable"):
         var_genes = adata.var_names[np.in1d(adata.var_names, var_genes)]
     else:
         var_genes = adata.var_names[adata.var[var_genes]]

@@ -311,11 +311,11 @@ def plotUpset(adata,
     if study_col is None:
         study_col = adata.uns[f"{mn_key}_params"]["study_col"]
     else:
-        assert study_col in adata.obs_keys(), "Study Col not in adata"
+        assert study_col in adata.obs.columns, "Study Col not in adata"
     if ct_col is None:
         ct_col = adata.uns[f"{mn_key}_params"]["ct_col"]
     else:
-        assert ct_col in adata.obs_keys(), "Cluster Col not in adata"
+        assert ct_col in adata.obs.columns, "Cluster Col not in adata"
 
     if type(metaclusters) is str:
         assert (metaclusters in adata.uns_keys()
@@ -598,11 +598,11 @@ def plotDotPlot(adata,
     if study_col is None:
         study_col = adata.uns[f"{mn_key}_params"]["study_col"]
     else:
-        assert study_col in adata.obs_keys(), "Must pass study col in obs keys"
+        assert study_col in adata.obs.columns, "Must pass study col in obs columns"
     if ct_col is None:
         ct_col = adata.uns[f"{mn_key}_params"]["ct_col"]
     else:
-        assert ct_col in adata.obs_keys(), "Must pass ct col in obs keys"
+        assert ct_col in adata.obs.columns, "Must pass ct col in obs columns"
 
     gs = gene_set.index[gene_set.astype(bool)]
     gs = np.intersect1d(gs, adata.var_names)
