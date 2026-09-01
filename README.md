@@ -72,12 +72,34 @@ pymn.MetaNeighborUS(
     fast_version=True,
     memory_constrained=True,
     cell_batch_size=256,
+    centroid_n_jobs=4,
     score_batch_size=64,
     temporary_directory="/path/to/fast/local/scratch",
 )
 ```
 
-`cell_batch_size` bounds dense rank-normalization and vote-generation batches.
+When each study is stored in a separate H5AD, it can be processed directly
+from disk. Each file is opened in read-only backed mode, only one all-cell gene
+batch is loaded at a time, and worker threads divide the in-memory batch:
+
+```python
+hvgs = pymn.variableGenesFromH5ADs(
+    ["study_1.h5ad", "study_2.h5ad"],
+    gene_batch_size=1024,
+    n_jobs=8,
+)
+```
+
+The returned list contains genes present and selected as highly variable in
+every file, in the gene order of the first H5AD. Files are processed
+sequentially, so only one backed study is open at a time.
+
+`cell_batch_size` bounds each dense rank-normalization and vote-generation
+batch. `centroid_n_jobs` processes independent centroid cell batches with
+worker threads; peak centroid-building work memory grows approximately as
+`cell_batch_size * centroid_n_jobs`, while the per-worker batch size remains
+unchanged. `centroid_n_jobs` does not multiply or otherwise change
+`score_batch_size`.
 `score_batch_size` bounds the vote columns ranked in memory for AUROC
 calculation. Votes are stored in a temporary memory-mapped file for one test
 study at a time and deleted after that study. The largest temporary file is

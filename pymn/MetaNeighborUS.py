@@ -6,6 +6,8 @@ import os
 import shutil
 import tempfile
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from scipy import sparse
 
 import gc
@@ -30,7 +32,8 @@ def MetaNeighborUS(adata,
                    cell_batch_size=256,
                    score_batch_size=64,
                    temporary_directory=None,
-                   vote_dtype="float64"):
+                   vote_dtype="float64",
+                   centroid_n_jobs=1):
     """Runs Unsupervised version of MetaNeighbor
 
     When it is difficult to know how cell type labels compare across datasets this
@@ -78,6 +81,10 @@ def MetaNeighborUS(adata,
         vote_dtype {str or numpy dtype} -- Floating dtype for normalized values,
             centroids, and temporary votes; float64 matches the legacy path most
             closely and float32 further reduces memory and disk use (default: {'float64'})
+        centroid_n_jobs {int} -- Number of worker threads used to normalize and
+            aggregate independent cell batches while building centroids. Peak
+            normalization memory grows approximately linearly with this value
+            (default: {1})
     """
 
     assert study_col in adata.obs.columns, "Study Col not in adata"
@@ -134,6 +141,7 @@ def MetaNeighborUS(adata,
                     score_batch_size=score_batch_size,
                     temporary_directory=temporary_directory,
                     vote_dtype=vote_dtype,
+                    centroid_n_jobs=centroid_n_jobs,
                 )
             else:
                 assert (
@@ -185,6 +193,7 @@ def MetaNeighborUS(adata,
             "score_batch_size": score_batch_size,
             "temporary_directory": None if temporary_directory is None else str(temporary_directory),
             "vote_dtype": str(np.dtype(vote_dtype)),
+            "centroid_n_jobs": centroid_n_jobs,
         }
         if compute_p:
             adata.uns[f'{mn_key}_pval'] = cell_p
@@ -359,11 +368,16 @@ def metaNeighborUS_fast(X, S, C, node_degree_normalization, one_vs_best,
 def _validate_memory_constrained_parameters(cell_batch_size,
                                             score_batch_size,
                                             vote_dtype,
-                                            temporary_directory):
+                                            temporary_directory,
+                                            centroid_n_jobs):
     if cell_batch_size <= 0:
         raise ValueError("cell_batch_size must be a positive integer")
     if score_batch_size <= 0:
         raise ValueError("score_batch_size must be a positive integer")
+    if not isinstance(centroid_n_jobs, (int, np.integer)):
+        raise TypeError("centroid_n_jobs must be an integer")
+    if centroid_n_jobs <= 0:
+        raise ValueError("centroid_n_jobs must be a positive integer")
     dtype = np.dtype(vote_dtype)
     if dtype not in (np.dtype("float32"), np.dtype("float64")):
         raise ValueError("vote_dtype must be float32 or float64")
@@ -428,38 +442,92 @@ def _build_cluster_centroids_batched(X,
                                      pair_codes,
                                      n_pairs,
                                      cell_batch_size,
-                                     dtype):
+                                     dtype,
+                                     n_jobs=1):
     n_cells = X.shape[0]
     n_genes = len(gene_indices)
     cluster_centroids = np.zeros((n_pairs, n_genes), dtype=dtype)
     valid_cells = np.zeros(n_cells, dtype=bool)
 
-    for start in range(0, n_cells, cell_batch_size):
-        stop = min(start + cell_batch_size, n_cells)
-        normalized = _normalize_cell_batch(
-            X, slice(start, stop), gene_indices, dtype
-        )
-        valid = ~np.any(np.isnan(normalized), axis=1)
+    def add_batch_result(batch_result):
+        start, stop, valid, present_codes, contribution = batch_result
         valid_cells[start:stop] = valid
-        if np.any(valid):
-            values = normalized if np.all(valid) else normalized[valid]
-            batch_codes = pair_codes[start:stop][valid]
-            present_codes, local_codes = np.unique(
-                batch_codes, return_inverse=True
+        if contribution is not None:
+            cluster_centroids[present_codes] += contribution
+
+    batches = [
+        (start, min(start + cell_batch_size, n_cells))
+        for start in range(0, n_cells, cell_batch_size)
+    ]
+    worker_count = min(n_jobs, len(batches))
+    if worker_count == 1:
+        for start, stop in batches:
+            add_batch_result(
+                _compute_cluster_centroid_batch(
+                    X,
+                    gene_indices,
+                    pair_codes,
+                    start,
+                    stop,
+                    dtype,
+                )
             )
-            membership = sparse.csr_matrix(
-                (
-                    np.ones(len(local_codes), dtype=dtype),
-                    (np.arange(len(local_codes)), local_codes),
-                ),
-                shape=(len(local_codes), len(present_codes)),
-            )
-            cluster_centroids[present_codes] += membership.T @ values
+    else:
+        # Keep at most one batch per worker in flight. Results are reduced in
+        # cell order so floating-point additions match the serial path.
+        pending = deque()
+        with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="pymn-centroid") as executor:
+            for start, stop in batches:
+                pending.append(
+                    executor.submit(
+                        _compute_cluster_centroid_batch,
+                        X,
+                        gene_indices,
+                        pair_codes,
+                        start,
+                        stop,
+                        dtype,
+                    )
+                )
+                if len(pending) == worker_count:
+                    add_batch_result(pending.popleft().result())
+            while pending:
+                add_batch_result(pending.popleft().result())
 
     n_cells_per_cluster = np.bincount(
         pair_codes[valid_cells], minlength=n_pairs
     ).astype(dtype, copy=False)
     return cluster_centroids, n_cells_per_cluster, valid_cells
+
+
+def _compute_cluster_centroid_batch(X,
+                                    gene_indices,
+                                    pair_codes,
+                                    start,
+                                    stop,
+                                    dtype):
+    """Normalize and aggregate one independent cell batch."""
+    normalized = _normalize_cell_batch(
+        X, slice(start, stop), gene_indices, dtype
+    )
+    valid = ~np.any(np.isnan(normalized), axis=1)
+    if not np.any(valid):
+        return start, stop, valid, None, None
+
+    values = normalized if np.all(valid) else normalized[valid]
+    batch_codes = pair_codes[start:stop][valid]
+    present_codes, local_codes = np.unique(batch_codes, return_inverse=True)
+    membership = sparse.csr_matrix(
+        (
+            np.ones(len(local_codes), dtype=dtype),
+            (np.arange(len(local_codes)), local_codes),
+        ),
+        shape=(len(local_codes), len(present_codes)),
+    )
+    contribution = membership.T @ values
+    return start, stop, valid, present_codes, contribution
 
 
 def _compute_batched_aurocs(vote_block,
@@ -531,13 +599,15 @@ def metaNeighborUS_fast_memory_constrained(
         cell_batch_size=256,
         score_batch_size=64,
         temporary_directory=None,
-        vote_dtype="float64"):
+        vote_dtype="float64",
+        centroid_n_jobs=1):
     """Fast MetaNeighborUS with bounded in-memory cell and score batches."""
     dtype, temporary_directory = _validate_memory_constrained_parameters(
         cell_batch_size,
         score_batch_size,
         vote_dtype,
         temporary_directory,
+        centroid_n_jobs,
     )
     gene_indices = np.asarray(gene_indices, dtype=np.intp)
     study_values = np.asarray(S)
@@ -554,6 +624,8 @@ def metaNeighborUS_fast_memory_constrained(
     n_genes = len(gene_indices)
     n_pairs = len(pair_labels)
     batch_cells = min(cell_batch_size, n_cells)
+    cell_batch_count = int(np.ceil(n_cells / cell_batch_size))
+    centroid_worker_count = min(centroid_n_jobs, cell_batch_count)
     input_itemsize = np.dtype(X.dtype).itemsize
     normalization_batch_bytes = batch_cells * n_genes * max(
         input_itemsize + np.dtype("float64").itemsize,
@@ -578,12 +650,16 @@ def metaNeighborUS_fast_memory_constrained(
         f"study_cell_types={n_pairs:,}\n"
         f"  cell_batch_size={cell_batch_size:,}, "
         f"score_batch_size={score_batch_size:,}, vote_dtype={dtype.name}\n"
+        f"  centroid_n_jobs={centroid_n_jobs:,}, "
+        f"active_centroid_workers={centroid_worker_count:,}\n"
         f"  temporary_directory={temporary_parent}\n"
         f"  estimated_max_vote_file={format_bytes(vote_file_upper_bound)}, "
         f"centroids={format_bytes(centroid_bytes)}, "
         f"results={format_bytes(result_bytes)}\n"
         "  estimated_peak_work_batches: "
-        f"normalization={format_bytes(normalization_batch_bytes)}, "
+        f"normalization_per_worker={format_bytes(normalization_batch_bytes)}, "
+        "concurrent_normalization="
+        f"{format_bytes(normalization_batch_bytes * centroid_worker_count)}, "
         f"score_ranking={format_bytes(score_batch_bytes)}\n"
         f"  cores: {numerical_thread_summary()}",
         flush=True,
@@ -601,6 +677,7 @@ def metaNeighborUS_fast_memory_constrained(
             len(pair_labels),
             cell_batch_size,
             dtype,
+            n_jobs=centroid_n_jobs,
         )
     )
     print(

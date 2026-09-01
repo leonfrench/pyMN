@@ -2,7 +2,7 @@
 from .MetaNeighbor import MetaNeighbor
 from .MetaNeighborUS import MetaNeighborUS
 from .trainModel import trainModel
-from .variableGenes import variableGenes
+from .variableGenes import variableGenes, variableGenesFromH5ADs
 from .plotting import (
     plotMetaNeighborUS,
     plotMetaNeighbor,

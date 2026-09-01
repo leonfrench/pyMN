@@ -3,6 +3,8 @@ import bottleneck
 from scipy import sparse
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import gc
 
 from .utils import format_bytes, numerical_thread_summary
 
@@ -131,6 +133,252 @@ def compute_var_genes_batched(X,
                 variance[start:stop] = block_variance
 
     return _select_genes_from_statistics(median, variance)
+
+
+def _validate_batch_parameters(gene_batch_size, n_jobs):
+    """Validate the batching parameters shared by the HVG entry points."""
+    if not isinstance(gene_batch_size, (int, np.integer)):
+        raise TypeError("gene_batch_size must be an integer")
+    if gene_batch_size <= 0:
+        raise ValueError("gene_batch_size must be a positive integer")
+    if not isinstance(n_jobs, (int, np.integer)):
+        raise TypeError("n_jobs must be an integer")
+    if n_jobs <= 0:
+        raise ValueError("n_jobs must be a positive integer")
+
+
+def _compute_matrix_gene_statistics(X):
+    """Compute median and variance for every column of an in-memory matrix."""
+    if sparse.issparse(X):
+        median = csc_median_axis_0(sparse.csc_matrix(X))
+        variance = sparse_var_axis0(X)
+    else:
+        X = np.asarray(X)
+        median = bottleneck.median(X, axis=0)
+        variance = np.var(X, axis=0)
+    return np.asarray(median), np.asarray(variance)
+
+
+def _compute_loaded_statistics_block(X, start, stop):
+    """Compute statistics for a column range of an in-memory gene batch."""
+    block_median, block_variance = _compute_matrix_gene_statistics(
+        X[:, start:stop]
+    )
+    return start, stop, block_median, block_variance
+
+
+def _compute_loaded_batch_statistics(X, n_jobs, executor=None):
+    """Compute one loaded gene batch, splitting its columns across threads."""
+    n_genes = X.shape[1]
+    worker_count = min(n_jobs, n_genes)
+    block_size = int(np.ceil(n_genes / worker_count))
+    blocks = [
+        (start, min(start + block_size, n_genes))
+        for start in range(0, n_genes, block_size)
+    ]
+    median = np.empty(n_genes, dtype=float)
+    variance = np.empty(n_genes, dtype=float)
+
+    if worker_count == 1:
+        completed_blocks = (
+            _compute_loaded_statistics_block(X, start, stop)
+            for start, stop in blocks
+        )
+    else:
+        futures = [
+            executor.submit(_compute_loaded_statistics_block, X, start, stop)
+            for start, stop in blocks
+        ]
+        completed_blocks = (
+            future.result() for future in as_completed(futures)
+        )
+
+    for start, stop, block_median, block_variance in completed_blocks:
+        median[start:stop] = block_median
+        variance[start:stop] = block_variance
+    return median, variance
+
+
+def _load_backed_gene_block(adata, start, stop):
+    """Materialize one all-cell gene block from a backed AnnData object."""
+    block = adata.X[:, start:stop]
+    # Some newer AnnData backed-array implementations expose ``to_memory``;
+    # h5py datasets and the older SparseDataset already materialize on slicing.
+    if hasattr(block, "to_memory"):
+        block = block.to_memory()
+    if not sparse.issparse(block):
+        block = np.asarray(block)
+    return block
+
+
+def _compute_backed_adata_gene_statistics(adata,
+                                           gene_batch_size,
+                                           n_jobs,
+                                           verbose):
+    """Stream all-cell gene batches from a backed AnnData object."""
+    n_cells, n_genes = adata.shape
+    if n_cells == 0:
+        raise ValueError("H5AD files must contain at least one cell")
+    if n_genes == 0:
+        raise ValueError("H5AD files must contain at least one gene")
+
+    median = np.empty(n_genes, dtype=float)
+    variance = np.empty(n_genes, dtype=float)
+    batch_count = int(np.ceil(n_genes / gene_batch_size))
+    worker_count = min(n_jobs, gene_batch_size, n_genes)
+    executor = None
+    if worker_count > 1:
+        executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="pymn-h5ad-hvg",
+        )
+
+    try:
+        for batch_number, start in enumerate(
+                range(0, n_genes, gene_batch_size), start=1):
+            stop = min(start + gene_batch_size, n_genes)
+            if verbose:
+                print(
+                    "[variableGenesFromH5ADs] "
+                    f"gene batch {batch_number}/{batch_count}: "
+                    f"{start:,}:{stop:,}",
+                    flush=True,
+                )
+            # Only this slice performs backed I/O. Worker threads operate on
+            # the resulting in-memory block, avoiding concurrent h5py access.
+            block = _load_backed_gene_block(adata, start, stop)
+            block_median, block_variance = _compute_loaded_batch_statistics(
+                block,
+                n_jobs=worker_count,
+                executor=executor,
+            )
+            median[start:stop] = block_median
+            variance[start:stop] = block_variance
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+    return median, variance
+
+
+def variableGenesFromH5ADs(h5ad_paths,
+                           gene_batch_size=1024,
+                           n_jobs=1,
+                           verbose=True):
+    """Identify HVGs across H5AD files without loading a whole file's X.
+
+    Each input H5AD is treated as one study. Files are opened one at a time in
+    read-only backed mode, and at most ``gene_batch_size`` expression columns
+    are explicitly loaded for all cells at once. The loaded columns are split
+    among ``n_jobs`` worker threads for median and variance calculation.
+
+    Per-study HVGs use the same median-bin/top-variance-quartile definition as
+    :func:`variableGenes`. The returned genes are highly variable in every
+    input study and present in every file. Gene identity is aligned by
+    ``var_names`` (column order may differ between files), and output order
+    follows the first file.
+
+    Parameters
+    ----------
+    h5ad_paths : path-like or iterable of path-like
+        One or more H5AD files. Each file represents a study.
+    gene_batch_size : int, default 1024
+        Maximum number of genes read from backed ``X`` at one time. Temporary
+        worker copies can add overhead within this bound.
+    n_jobs : int, default 1
+        Number of worker threads used to compute statistics within each loaded
+        gene batch. HDF5 reads themselves remain sequential.
+    verbose : bool, default True
+        Print file and gene-batch progress.
+
+    Returns
+    -------
+    list of str
+        Gene names selected as highly variable in every input file.
+    """
+    _validate_batch_parameters(gene_batch_size, n_jobs)
+    if not isinstance(verbose, (bool, np.bool_)):
+        raise TypeError("verbose must be a boolean")
+
+    if isinstance(h5ad_paths, (str, bytes, Path)):
+        paths = [Path(h5ad_paths)]
+    else:
+        try:
+            paths = [Path(path) for path in h5ad_paths]
+        except TypeError:
+            raise TypeError(
+                "h5ad_paths must be a path or an iterable of paths"
+            )
+    if not paths:
+        raise ValueError("h5ad_paths must contain at least one file")
+    missing_paths = [str(path) for path in paths if not path.is_file()]
+    if missing_paths:
+        raise FileNotFoundError(
+            "H5AD file(s) do not exist: " + ", ".join(missing_paths)
+        )
+
+    # Import lazily so the existing AnnData-object API keeps its lightweight
+    # import behavior.
+    import anndata
+
+    common_genes = None
+    highly_variable_count = None
+    for study_number, path in enumerate(paths, start=1):
+        if verbose:
+            print(
+                "[variableGenesFromH5ADs] "
+                f"study {study_number}/{len(paths)}: {path}",
+                flush=True,
+            )
+        adata = anndata.read_h5ad(str(path), backed="r")
+        try:
+            genes = pd.Index(adata.var_names.astype(str))
+            if not genes.is_unique:
+                raise ValueError(
+                    f"H5AD var_names must be unique: {path}"
+                )
+            median, variance = _compute_backed_adata_gene_statistics(
+                adata,
+                gene_batch_size=gene_batch_size,
+                n_jobs=n_jobs,
+                verbose=verbose,
+            )
+            study_hvgs = _select_genes_from_statistics(median, variance)
+        finally:
+            adata.file.close()
+        # Release cell-independent annotations (which AnnData may still load
+        # eagerly in backed mode) before opening the next large study.
+        del adata
+        gc.collect()
+
+        if common_genes is None:
+            common_genes = genes
+            highly_variable_count = study_hvgs.astype(np.int64)
+        else:
+            shared_mask = common_genes.isin(genes)
+            common_genes = common_genes[shared_mask]
+            highly_variable_count = highly_variable_count[shared_mask]
+            if len(common_genes) == 0:
+                raise ValueError("Input H5AD files have no genes in common")
+            positions = genes.get_indexer(common_genes)
+            highly_variable_count += study_hvgs[positions]
+
+        if verbose:
+            print(
+                "[variableGenesFromH5ADs] "
+                f"study_selected={int(study_hvgs.sum()):,}, "
+                f"shared_genes={len(common_genes):,}",
+                flush=True,
+            )
+
+    combined = highly_variable_count == len(paths)
+    result = common_genes[combined].tolist()
+    if verbose:
+        print(
+            "[variableGenesFromH5ADs] complete: "
+            f"selected_genes={len(result):,}",
+            flush=True,
+        )
+    return result
 
 
 def variableGenes(adata,
