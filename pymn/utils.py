@@ -4,6 +4,31 @@ import pandas as pd
 import bottleneck
 import gc
 import warnings
+import os
+from threadpoolctl import threadpool_info
+
+
+def format_bytes(n_bytes):
+    """Format a byte count for concise progress output."""
+    value = float(n_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(value) < 1024 or unit == "PiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def numerical_thread_summary():
+    """Describe detected numerical thread pools and available logical CPUs."""
+    pools = threadpool_info()
+    detected = []
+    for pool in pools:
+        implementation = pool.get("internal_api") or pool.get("user_api")
+        threads = pool.get("num_threads")
+        item = f"{implementation}={threads}"
+        if item not in detected:
+            detected.append(item)
+    pool_summary = ", ".join(detected) if detected else "none detected"
+    return f"logical_cpus={os.cpu_count()}, thread_pools=[{pool_summary}]"
 
 
 def create_cell_labels(adata, study_col, ct_col):

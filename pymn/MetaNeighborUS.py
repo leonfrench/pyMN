@@ -2,6 +2,11 @@ import numpy as np
 import pandas as pd
 import bottleneck
 import warnings
+import os
+import shutil
+import tempfile
+import time
+from scipy import sparse
 
 import gc
 
@@ -20,7 +25,12 @@ def MetaNeighborUS(adata,
                    trained_model=None,
                    save_uns=True,
                    compute_p=False,
-                   mn_key="MetaNeighborUS"):
+                   mn_key="MetaNeighborUS",
+                   memory_constrained=False,
+                   cell_batch_size=256,
+                   score_batch_size=64,
+                   temporary_directory=None,
+                   vote_dtype="float64"):
     """Runs Unsupervised version of MetaNeighbor
 
     When it is difficult to know how cell type labels compare across datasets this
@@ -57,6 +67,17 @@ def MetaNeighborUS(adata,
         save_uns {bool} -- Boolean indicating whether to save in adata.uns[mn_key],
             when False returns cell type x cell type AUROCs dataframe (default: {True})
         mn_key {str} -- Key for saving in adata.uns[mn_key] (default: {'MetaNeighborUS'})
+        memory_constrained {bool} -- Use the batched fast implementation and a
+            temporary memory map for votes (default: {False})
+        cell_batch_size {int} -- Maximum cells normalized together when
+            memory_constrained is True (default: {256})
+        score_batch_size {int} -- Maximum vote columns ranked together when
+            memory_constrained is True (default: {64})
+        temporary_directory {str or PathLike} -- Parent directory for temporary
+            memory-mapped vote files (default: {None})
+        vote_dtype {str or numpy dtype} -- Floating dtype for normalized values,
+            centroids, and temporary votes; float64 matches the legacy path most
+            closely and float32 further reduces memory and disk use (default: {'float64'})
     """
 
     assert study_col in adata.obs_keys(), "Study Col not in adata"
@@ -84,25 +105,49 @@ def MetaNeighborUS(adata,
         assert (fast_version or trained_model is not None
                 ), "If you want to run in one_vs_best mode you must also \
          run in fast version mode or use a pretrained model"
+    if memory_constrained:
+        if trained_model is not None:
+            raise NotImplementedError(
+                "memory_constrained currently supports de novo fast_version runs only"
+            )
+        if not fast_version:
+            raise ValueError(
+                "memory_constrained=True currently requires fast_version=True"
+            )
 
     if trained_model is None:
         assert (np.unique(adata.obs[study_col].values).shape[0] >
                 1), "Need more than 1 study"
         if fast_version:
             # Fast verion doesn't work with Categorical datatype
-            assert (
-                adata.obs[study_col].dtype.name != "category"
-            ), "Study Col is a category type, cast to either string or int"
-            assert (
-                adata.obs[ct_col].dtype.name != "category"
-            ), "Cell Type Col is a category type, cast to either string or int"
+            if memory_constrained:
+                gene_indices = adata.var_names.get_indexer(var_genes)
+                cell_nv = metaNeighborUS_fast_memory_constrained(
+                    adata.X,
+                    adata.obs[study_col],
+                    adata.obs[ct_col],
+                    gene_indices,
+                    node_degree_normalization,
+                    one_vs_best,
+                    compute_p,
+                    cell_batch_size=cell_batch_size,
+                    score_batch_size=score_batch_size,
+                    temporary_directory=temporary_directory,
+                    vote_dtype=vote_dtype,
+                )
+            else:
+                assert (
+                    adata.obs[study_col].dtype.name != "category"
+                ), "Study Col is a category type, cast to either string or int"
+                assert (
+                    adata.obs[ct_col].dtype.name != "category"
+                ), "Cell Type Col is a category type, cast to either string or int"
 
-
-            cell_nv = metaNeighborUS_fast(adata[:, var_genes].X,
-                                          adata.obs[study_col],
-                                          adata.obs[ct_col],
-                                          node_degree_normalization,
-                                          one_vs_best, compute_p)
+                cell_nv = metaNeighborUS_fast(adata[:, var_genes].X,
+                                              adata.obs[study_col],
+                                              adata.obs[ct_col],
+                                              node_degree_normalization,
+                                              one_vs_best, compute_p)
         else:
             cell_nv = metaNeighborUS_default(adata[:, var_genes], study_col,
                                              ct_col, node_degree_normalization,
@@ -135,6 +180,11 @@ def MetaNeighborUS(adata,
             "ct_col": ct_col,
             "one_vs_best": one_vs_best,
             "symmetric_output": symmetric_output,
+            "memory_constrained": memory_constrained,
+            "cell_batch_size": cell_batch_size,
+            "score_batch_size": score_batch_size,
+            "temporary_directory": None if temporary_directory is None else str(temporary_directory),
+            "vote_dtype": str(np.dtype(vote_dtype)),
         }
         if compute_p:
             adata.uns[f'{mn_key}_pval'] = cell_p
@@ -303,6 +353,424 @@ def metaNeighborUS_fast(X, S, C, node_degree_normalization, one_vs_best,
 
 
     result = result[result.index]
+    return result
+
+
+def _validate_memory_constrained_parameters(cell_batch_size,
+                                            score_batch_size,
+                                            vote_dtype,
+                                            temporary_directory):
+    if cell_batch_size <= 0:
+        raise ValueError("cell_batch_size must be a positive integer")
+    if score_batch_size <= 0:
+        raise ValueError("score_batch_size must be a positive integer")
+    dtype = np.dtype(vote_dtype)
+    if dtype not in (np.dtype("float32"), np.dtype("float64")):
+        raise ValueError("vote_dtype must be float32 or float64")
+    if temporary_directory is not None:
+        temporary_directory = os.fspath(temporary_directory)
+        if not os.path.isdir(temporary_directory):
+            raise FileNotFoundError(
+                f"temporary_directory does not exist: {temporary_directory}"
+            )
+    return dtype, temporary_directory
+
+
+def _encode_study_cell_types(studies, cell_types):
+    """Encode study/cell-type pairs without one joined string per cell."""
+    studies = np.asarray(studies)
+    cell_types = np.asarray(cell_types)
+    study_levels, study_codes = np.unique(studies, return_inverse=True)
+    cell_type_levels, cell_type_codes = np.unique(cell_types,
+                                                   return_inverse=True)
+
+    pair_keys = study_codes.astype(np.int64, copy=False)
+    pair_keys = pair_keys * len(cell_type_levels) + cell_type_codes
+    observed_keys, pair_codes = np.unique(pair_keys, return_inverse=True)
+    pair_study_codes = observed_keys // len(cell_type_levels)
+    pair_cell_type_codes = observed_keys % len(cell_type_levels)
+    pair_labels = np.asarray([
+        f"{study_levels[study]}|{cell_type_levels[cell_type]}"
+        for study, cell_type in zip(pair_study_codes, pair_cell_type_codes)
+    ])
+
+    # The legacy final result is ordered by sorted study and then by sorted
+    # cell type within that study (predict_and_score concatenates by study and
+    # finally reorders columns to match those rows).
+    return pair_codes, pair_labels, study_levels[pair_study_codes]
+
+
+def _get_expression_block(X, row_selector, gene_indices):
+    if sparse.issparse(X):
+        return X[row_selector, :][:, gene_indices].toarray()
+
+    if isinstance(row_selector, slice):
+        rows = np.arange(*row_selector.indices(X.shape[0]), dtype=np.intp)
+    else:
+        rows = np.asarray(row_selector, dtype=np.intp)
+    return np.asarray(X[np.ix_(rows, gene_indices)])
+
+
+def _normalize_cell_batch(X, row_selector, gene_indices, dtype):
+    """Rank-normalize a bounded batch, matching normalize_cells semantics."""
+    dense = _get_expression_block(X, row_selector, gene_indices)
+    normalized = bottleneck.rankdata(dense, axis=1).astype(dtype, copy=False)
+    average = np.mean(normalized, axis=1)
+    normalized -= average[:, None]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        norm = np.sqrt(bottleneck.nansum(normalized**2, axis=1))[:, None]
+        normalized /= norm
+    return normalized
+
+
+def _build_cluster_centroids_batched(X,
+                                     gene_indices,
+                                     pair_codes,
+                                     n_pairs,
+                                     cell_batch_size,
+                                     dtype):
+    n_cells = X.shape[0]
+    n_genes = len(gene_indices)
+    cluster_centroids = np.zeros((n_pairs, n_genes), dtype=dtype)
+    valid_cells = np.zeros(n_cells, dtype=bool)
+
+    for start in range(0, n_cells, cell_batch_size):
+        stop = min(start + cell_batch_size, n_cells)
+        normalized = _normalize_cell_batch(
+            X, slice(start, stop), gene_indices, dtype
+        )
+        valid = ~np.any(np.isnan(normalized), axis=1)
+        valid_cells[start:stop] = valid
+        if np.any(valid):
+            values = normalized if np.all(valid) else normalized[valid]
+            batch_codes = pair_codes[start:stop][valid]
+            present_codes, local_codes = np.unique(
+                batch_codes, return_inverse=True
+            )
+            membership = sparse.csr_matrix(
+                (
+                    np.ones(len(local_codes), dtype=dtype),
+                    (np.arange(len(local_codes)), local_codes),
+                ),
+                shape=(len(local_codes), len(present_codes)),
+            )
+            cluster_centroids[present_codes] += membership.T @ values
+
+    n_cells_per_cluster = np.bincount(
+        pair_codes[valid_cells], minlength=n_pairs
+    ).astype(dtype, copy=False)
+    return cluster_centroids, n_cells_per_cluster, valid_cells
+
+
+def _compute_batched_aurocs(vote_block,
+                            positive_matrix,
+                            n_positive,
+                            compute_p):
+    ranks = bottleneck.rankdata(vote_block, axis=0)
+    sum_positive_ranks = np.asarray(positive_matrix.T @ ranks)
+    n_negative = positive_matrix.shape[0] - n_positive
+    roc = sum_positive_ranks / n_positive[:, None]
+    roc -= (n_positive[:, None] + 1) / 2
+    roc /= n_negative[:, None]
+
+    if not compute_p:
+        return roc
+    n_positive_2d = n_positive[:, None]
+    n_negative_2d = n_negative[:, None]
+    U = roc * n_positive_2d * n_negative_2d
+    Z = np.abs(U - (n_positive_2d * n_negative_2d / 2))
+    Z /= np.sqrt(
+        n_positive_2d
+        * n_negative_2d
+        * (n_positive_2d + n_negative_2d + 1)
+        / 12
+    )
+    return roc, stats.norm.sf(Z)
+
+
+def _fill_vote_memmap(votes,
+                      X,
+                      test_cell_indices,
+                      gene_indices,
+                      cluster_centroids,
+                      n_cells_per_cluster,
+                      cluster_study_codes,
+                      study_centroids,
+                      n_cells_per_study,
+                      node_degree_normalization,
+                      cell_batch_size,
+                      dtype):
+    for start in range(0, len(test_cell_indices), cell_batch_size):
+        stop = min(start + cell_batch_size, len(test_cell_indices))
+        row_indices = test_cell_indices[start:stop]
+        normalized = _normalize_cell_batch(
+            X, row_indices, gene_indices, dtype
+        )
+        batch_votes = normalized @ cluster_centroids.T
+        if node_degree_normalization:
+            batch_votes += n_cells_per_cluster
+            node_degree = normalized @ study_centroids.T
+            node_degree += n_cells_per_study
+            for train_study_code in range(study_centroids.shape[0]):
+                is_train = cluster_study_codes == train_study_code
+                batch_votes[:, is_train] /= node_degree[:,
+                                                        train_study_code][:,
+                                                                          None]
+        votes[start:stop, :] = batch_votes
+    votes.flush()
+
+
+def metaNeighborUS_fast_memory_constrained(
+        X,
+        S,
+        C,
+        gene_indices,
+        node_degree_normalization,
+        one_vs_best,
+        compute_p,
+        cell_batch_size=256,
+        score_batch_size=64,
+        temporary_directory=None,
+        vote_dtype="float64"):
+    """Fast MetaNeighborUS with bounded in-memory cell and score batches."""
+    dtype, temporary_directory = _validate_memory_constrained_parameters(
+        cell_batch_size,
+        score_batch_size,
+        vote_dtype,
+        temporary_directory,
+    )
+    gene_indices = np.asarray(gene_indices, dtype=np.intp)
+    study_values = np.asarray(S)
+    pair_codes, pair_labels, pair_studies = _encode_study_cell_types(S, C)
+    started_at = time.perf_counter()
+    temporary_parent = os.path.abspath(
+        tempfile.gettempdir()
+        if temporary_directory is None
+        else temporary_directory
+    )
+    _, study_cell_counts = np.unique(study_values, return_counts=True)
+    largest_study_cells = int(study_cell_counts.max())
+    n_cells = X.shape[0]
+    n_genes = len(gene_indices)
+    n_pairs = len(pair_labels)
+    batch_cells = min(cell_batch_size, n_cells)
+    input_itemsize = np.dtype(X.dtype).itemsize
+    normalization_batch_bytes = batch_cells * n_genes * max(
+        input_itemsize + np.dtype("float64").itemsize,
+        input_itemsize + 2 * dtype.itemsize,
+    )
+    centroid_bytes = n_pairs * n_genes * dtype.itemsize
+    vote_file_upper_bound = largest_study_cells * n_pairs * dtype.itemsize
+    score_columns = min(score_batch_size, n_pairs)
+    score_batch_bytes = (
+        largest_study_cells
+        * score_columns
+        * (dtype.itemsize + np.dtype("float64").itemsize)
+    )
+    result_multiplier = 2 if compute_p else 1
+    result_bytes = n_pairs * n_pairs * np.dtype("float64").itemsize
+    result_bytes *= result_multiplier
+    mode = "one_vs_best" if one_vs_best else "all_vs_all"
+    print(
+        "[MetaNeighborUS memory_constrained] setup\n"
+        f"  mode={mode}, cells={n_cells:,}, selected_genes={n_genes:,}, "
+        f"studies={len(np.unique(study_values)):,}, "
+        f"study_cell_types={n_pairs:,}\n"
+        f"  cell_batch_size={cell_batch_size:,}, "
+        f"score_batch_size={score_batch_size:,}, vote_dtype={dtype.name}\n"
+        f"  temporary_directory={temporary_parent}\n"
+        f"  estimated_max_vote_file={format_bytes(vote_file_upper_bound)}, "
+        f"centroids={format_bytes(centroid_bytes)}, "
+        f"results={format_bytes(result_bytes)}\n"
+        "  estimated_peak_work_batches: "
+        f"normalization={format_bytes(normalization_batch_bytes)}, "
+        f"score_ranking={format_bytes(score_batch_bytes)}\n"
+        f"  cores: {numerical_thread_summary()}",
+        flush=True,
+    )
+    print(
+        "[MetaNeighborUS memory_constrained] building cluster centroids",
+        flush=True,
+    )
+
+    cluster_centroids, n_cells_per_cluster, valid_cells = (
+        _build_cluster_centroids_batched(
+            X,
+            gene_indices,
+            pair_codes,
+            len(pair_labels),
+            cell_batch_size,
+            dtype,
+        )
+    )
+    print(
+        "[MetaNeighborUS memory_constrained] centroids complete: "
+        f"valid_cells={int(valid_cells.sum()):,}/{n_cells:,}",
+        flush=True,
+    )
+
+    # Match the legacy behavior of removing cells with undefined variance,
+    # including removal of any study/cell-type labels left without cells.
+    keep_pairs = n_cells_per_cluster > 0
+    if not np.all(keep_pairs):
+        old_to_new = np.full(len(keep_pairs), -1, dtype=np.intp)
+        old_to_new[keep_pairs] = np.arange(np.count_nonzero(keep_pairs))
+        pair_codes = old_to_new[pair_codes]
+        pair_labels = pair_labels[keep_pairs]
+        pair_studies = pair_studies[keep_pairs]
+        cluster_centroids = cluster_centroids[keep_pairs]
+        n_cells_per_cluster = n_cells_per_cluster[keep_pairs]
+
+    study_order = np.unique(pair_studies)
+    cluster_study_codes = np.searchsorted(study_order, pair_studies)
+    study_centroids = np.zeros(
+        (len(study_order), cluster_centroids.shape[1]), dtype=dtype
+    )
+    np.add.at(study_centroids, cluster_study_codes, cluster_centroids)
+    n_cells_per_study = np.bincount(
+        cluster_study_codes,
+        weights=n_cells_per_cluster,
+        minlength=len(study_order),
+    ).astype(dtype, copy=False)
+
+    n_pairs = len(pair_labels)
+    result = np.full((n_pairs, n_pairs), np.nan, dtype=float)
+    result_p = (
+        np.full((n_pairs, n_pairs), np.nan, dtype=float)
+        if compute_p
+        else None
+    )
+
+    for study_number, test_study in enumerate(study_order, start=1):
+        test_cell_indices = np.flatnonzero(valid_cells
+                                           & (study_values == test_study))
+        test_pair_indices = np.flatnonzero(pair_studies == test_study)
+        global_to_local = np.full(n_pairs, -1, dtype=np.intp)
+        global_to_local[test_pair_indices] = np.arange(len(test_pair_indices))
+        local_cell_codes = global_to_local[pair_codes[test_cell_indices]]
+        n_positive = np.bincount(
+            local_cell_codes, minlength=len(test_pair_indices)
+        ).astype(float, copy=False)
+        positive_matrix = sparse.csr_matrix(
+            (
+                np.ones(len(test_cell_indices), dtype=float),
+                (np.arange(len(test_cell_indices)), local_cell_codes),
+            ),
+            shape=(len(test_cell_indices), len(test_pair_indices)),
+        )
+
+        required_vote_bytes = (
+            len(test_cell_indices) * n_pairs * dtype.itemsize
+        )
+        available_vote_bytes = shutil.disk_usage(temporary_parent).free
+        if required_vote_bytes > available_vote_bytes:
+            raise OSError(
+                "Insufficient temporary storage for memory-constrained votes: "
+                f"need {required_vote_bytes} bytes for study {test_study!r}, "
+                f"but {available_vote_bytes} bytes are available in "
+                f"{temporary_parent!r}"
+            )
+        print(
+            "[MetaNeighborUS memory_constrained] "
+            f"study {study_number}/{len(study_order)}: {test_study!s}, "
+            f"cells={len(test_cell_indices):,}, "
+            f"vote_file={format_bytes(required_vote_bytes)}, "
+            f"free_scratch={format_bytes(available_vote_bytes)}",
+            flush=True,
+        )
+
+        with tempfile.TemporaryDirectory(
+                prefix="pymn-votes-", dir=temporary_directory) as work_dir:
+            vote_path = os.path.join(work_dir, "votes.dat")
+            votes = np.memmap(
+                vote_path,
+                mode="w+",
+                dtype=dtype,
+                shape=(len(test_cell_indices), n_pairs),
+                order="F",
+            )
+            _fill_vote_memmap(
+                votes,
+                X,
+                test_cell_indices,
+                gene_indices,
+                cluster_centroids,
+                n_cells_per_cluster,
+                cluster_study_codes,
+                study_centroids,
+                n_cells_per_study,
+                node_degree_normalization,
+                cell_batch_size,
+                dtype,
+            )
+
+            categorical_index = None
+            if one_vs_best:
+                categorical_index = pd.CategoricalIndex(
+                    pd.Categorical.from_codes(
+                        local_cell_codes,
+                        categories=pair_labels[test_pair_indices],
+                    )
+                )
+
+            for score_start in range(0, n_pairs, score_batch_size):
+                score_stop = min(score_start + score_batch_size, n_pairs)
+                score_columns = np.arange(score_start, score_stop)
+                vote_block = np.array(
+                    votes[:, score_start:score_stop], copy=True, order="F"
+                )
+                block_result = _compute_batched_aurocs(
+                    vote_block,
+                    positive_matrix,
+                    n_positive,
+                    compute_p,
+                )
+                if compute_p:
+                    block_aurocs, block_p = block_result
+                    result_p[np.ix_(test_pair_indices,
+                                    score_columns)] = block_p
+                else:
+                    block_aurocs = block_result
+
+                if one_vs_best:
+                    votes_dataframe = pd.DataFrame(
+                        vote_block,
+                        index=categorical_index,
+                        columns=pair_labels[score_columns],
+                    )
+                    aurocs_dataframe = pd.DataFrame(
+                        block_aurocs,
+                        index=pair_labels[test_pair_indices],
+                        columns=pair_labels[score_columns],
+                    )
+                    block_aurocs = compute_1v1_aurocs(
+                        votes_dataframe, aurocs_dataframe
+                    ).to_numpy(dtype=float)
+
+                result[np.ix_(test_pair_indices,
+                              score_columns)] = block_aurocs
+
+            del votes
+            gc.collect()
+        print(
+            "[MetaNeighborUS memory_constrained] "
+            f"study {study_number}/{len(study_order)} complete; "
+            "temporary vote file removed",
+            flush=True,
+        )
+
+    result = pd.DataFrame(result, index=pair_labels, columns=pair_labels)
+    elapsed = time.perf_counter() - started_at
+    print(
+        "[MetaNeighborUS memory_constrained] complete: "
+        f"mode={mode}, elapsed={elapsed:.2f}s, studies={len(study_order):,}",
+        flush=True,
+    )
+    if compute_p:
+        result_p = pd.DataFrame(result_p,
+                                index=pair_labels,
+                                columns=pair_labels)
+        return result, result_p
     return result
 
 

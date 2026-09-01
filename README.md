@@ -50,6 +50,51 @@ For detailed tutorials refer to the [notebooks](./notebooks) folder for 3 differ
 	1) Ones that describe data already in the Anndata
 	2) Ones that tune the functionality of the method
 
+### Memory-constrained sparse workflows
+
+For sparse inputs that do not fit the legacy dense fast path, highly variable
+gene selection and de novo `MetaNeighborUS(fast_version=True)` can be run in
+bounded batches:
+
+```python
+pymn.variableGenes(
+    adata,
+    study_col="donor",
+    memory_constrained=True,
+    gene_batch_size=1024,
+)
+
+pymn.MetaNeighborUS(
+    adata,
+    study_col="donor",
+    ct_col="class",
+    fast_version=True,
+    memory_constrained=True,
+    cell_batch_size=256,
+    score_batch_size=64,
+    temporary_directory="/path/to/fast/local/scratch",
+)
+```
+
+`cell_batch_size` bounds dense rank-normalization and vote-generation batches.
+`score_batch_size` bounds the vote columns ranked in memory for AUROC
+calculation. Votes are stored in a temporary memory-mapped file for one test
+study at a time and deleted after that study. The largest temporary file is
+approximately `largest_study_cell_count * study_cell_type_count * 8` bytes with
+the default `vote_dtype="float64"`. `vote_dtype="float32"` halves centroid and
+temporary-vote storage but can introduce small numerical differences.
+
+The memory-constrained path accepts categorical study and cell-type columns.
+It currently applies to de novo runs with `fast_version=True`; pretrained and
+non-fast runs continue to use the legacy implementations.
+
+When enabled, the memory-constrained functions print their batch settings,
+detected numerical thread counts, estimated working and temporary-file sizes,
+per-study progress, temporary-file cleanup, and completion time.
+
+The reproducible three-core HMBA benchmark, saved correctness matrices, and
+comparison command are documented in [benchmarks/README.md](./benchmarks/README.md).
+
 
 ## Issues and Bugs
 

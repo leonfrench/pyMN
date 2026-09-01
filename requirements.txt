@@ -7,3 +7,5 @@ scanpy
 bottleneck
 networkx
 upsetplot
+psutil
+threadpoolctl
