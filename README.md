@@ -79,8 +79,9 @@ pymn.MetaNeighborUS(
 ```
 
 When each study is stored in a separate H5AD, it can be processed directly
-from disk. Each file is opened in read-only backed mode, only one all-cell gene
-batch is loaded at a time, and worker threads divide the in-memory batch:
+from disk. The files are first opened in read-only backed mode to identify the
+genes shared by every study. Only those shared genes are then processed, one
+all-cell gene batch at a time, and worker threads divide the in-memory batch:
 
 ```python
 hvgs = pymn.variableGenesFromH5ADs(
@@ -90,9 +91,10 @@ hvgs = pymn.variableGenesFromH5ADs(
 )
 ```
 
-The returned list contains genes present and selected as highly variable in
-every file, in the gene order of the first H5AD. Files are processed
-sequentially, so only one backed study is open at a time.
+The returned list contains genes selected as highly variable in every file,
+in the gene order of the first H5AD. Backed file handles remain open while
+expression data are processed sequentially, but only the current shared-gene
+batch is loaded into memory.
 
 `cell_batch_size` bounds each dense rank-normalization and vote-generation
 batch. `centroid_n_jobs` processes independent centroid cell batches with

@@ -211,16 +211,43 @@ def _load_backed_gene_block(adata, start, stop):
     return block
 
 
+def _load_backed_gene_index_block(adata, gene_indices):
+    """Materialize selected backed columns in the requested gene order."""
+    gene_indices = np.asarray(gene_indices, dtype=np.intp)
+    order = np.argsort(gene_indices)
+    sorted_indices = gene_indices[order]
+    block = adata.X[:, sorted_indices]
+    if hasattr(block, "to_memory"):
+        block = block.to_memory()
+    if not sparse.issparse(block):
+        block = np.asarray(block)
+
+    # h5py requires increasing indices for fancy indexing. Restore the shared
+    # gene order only after the selected columns have been materialized.
+    if not np.array_equal(order, np.arange(len(order))):
+        block = block[:, np.argsort(order)]
+    return block
+
+
 def _compute_backed_adata_gene_statistics(adata,
                                            gene_batch_size,
                                            n_jobs,
-                                           verbose):
-    """Stream all-cell gene batches from a backed AnnData object."""
-    n_cells, n_genes = adata.shape
+                                           verbose,
+                                           gene_indices=None):
+    """Stream selected all-cell gene batches from a backed AnnData object."""
+    n_cells, total_genes = adata.shape
     if n_cells == 0:
         raise ValueError("H5AD files must contain at least one cell")
-    if n_genes == 0:
+    if total_genes == 0:
         raise ValueError("H5AD files must contain at least one gene")
+
+    if gene_indices is None:
+        n_genes = total_genes
+    else:
+        gene_indices = np.asarray(gene_indices, dtype=np.intp)
+        n_genes = len(gene_indices)
+        if n_genes == 0:
+            raise ValueError("At least one gene must be selected")
 
     median = np.empty(n_genes, dtype=float)
     variance = np.empty(n_genes, dtype=float)
@@ -246,7 +273,13 @@ def _compute_backed_adata_gene_statistics(adata,
                 )
             # Only this slice performs backed I/O. Worker threads operate on
             # the resulting in-memory block, avoiding concurrent h5py access.
-            block = _load_backed_gene_block(adata, start, stop)
+            if gene_indices is None:
+                block = _load_backed_gene_block(adata, start, stop)
+            else:
+                block = _load_backed_gene_index_block(
+                    adata,
+                    gene_indices[start:stop],
+                )
             block_median, block_variance = _compute_loaded_batch_statistics(
                 block,
                 n_jobs=worker_count,
@@ -266,10 +299,12 @@ def variableGenesFromH5ADs(h5ad_paths,
                            verbose=True):
     """Identify HVGs across H5AD files without loading a whole file's X.
 
-    Each input H5AD is treated as one study. Files are opened one at a time in
-    read-only backed mode, and at most ``gene_batch_size`` expression columns
-    are explicitly loaded for all cells at once. The loaded columns are split
-    among ``n_jobs`` worker threads for median and variance calculation.
+    Each input H5AD is treated as one study. All files are first opened in
+    read-only backed mode to identify their shared gene universe. Expression
+    data are then processed one study at a time, and at most
+    ``gene_batch_size`` shared-gene columns are explicitly loaded for all cells
+    at once. The loaded columns are split among ``n_jobs`` worker threads for
+    median and variance calculation.
 
     Per-study HVGs use the same median-bin/top-variance-quartile definition as
     :func:`variableGenes`. The returned genes are highly variable in every
@@ -320,58 +355,90 @@ def variableGenesFromH5ADs(h5ad_paths,
     # import behavior.
     import anndata
 
-    common_genes = None
-    highly_variable_count = None
-    for study_number, path in enumerate(paths, start=1):
-        if verbose:
-            print(
-                "[variableGenesFromH5ADs] "
-                f"study {study_number}/{len(paths)}: {path}",
-                flush=True,
-            )
-        adata = anndata.read_h5ad(str(path), backed="r")
-        try:
+    studies = []
+    try:
+        common_genes = None
+        for study_number, path in enumerate(paths, start=1):
+            if verbose:
+                print(
+                    "[variableGenesFromH5ADs] "
+                    f"loading H5AD {study_number}/{len(paths)}: {path}",
+                    flush=True,
+                )
+            adata = anndata.read_h5ad(str(path), backed="r")
+            studies.append((path, adata))
             genes = pd.Index(adata.var_names.astype(str))
             if not genes.is_unique:
                 raise ValueError(
                     f"H5AD var_names must be unique: {path}"
                 )
+            if adata.n_obs == 0:
+                raise ValueError("H5AD files must contain at least one cell")
+            if adata.n_vars == 0:
+                raise ValueError("H5AD files must contain at least one gene")
+            if common_genes is None:
+                common_genes = genes
+            else:
+                common_genes = common_genes[common_genes.isin(genes)]
+            if verbose:
+                print(
+                    "[variableGenesFromH5ADs] "
+                    f"loaded H5AD {study_number}/{len(paths)}: "
+                    f"cells={adata.n_obs:,}, genes={adata.n_vars:,}, "
+                    f"shared_genes={len(common_genes):,}",
+                    flush=True,
+                )
+
+        if len(common_genes) == 0:
+            raise ValueError("Input H5AD files have no genes in common")
+
+        highly_variable_in_all = np.ones(len(common_genes), dtype=bool)
+        for study_number, (path, adata) in enumerate(studies, start=1):
+            if verbose:
+                print(
+                    "[variableGenesFromH5ADs] "
+                    f"computing variable statistics "
+                    f"{study_number}/{len(paths)}: {path} "
+                    f"({len(common_genes):,} shared genes)",
+                    flush=True,
+                )
+            genes = pd.Index(adata.var_names.astype(str))
+            gene_indices = genes.get_indexer(common_genes)
+            if (
+                len(common_genes) == adata.n_vars
+                and np.array_equal(
+                    gene_indices,
+                    np.arange(adata.n_vars, dtype=np.intp),
+                )
+            ):
+                gene_indices = None
             median, variance = _compute_backed_adata_gene_statistics(
                 adata,
                 gene_batch_size=gene_batch_size,
                 n_jobs=n_jobs,
                 verbose=verbose,
+                gene_indices=gene_indices,
             )
             study_hvgs = _select_genes_from_statistics(median, variance)
-        finally:
+            highly_variable_in_all &= study_hvgs
+
+            if verbose:
+                print(
+                    "[variableGenesFromH5ADs] "
+                    f"computed variable statistics "
+                    f"{study_number}/{len(paths)}: "
+                    f"selected_genes={int(study_hvgs.sum()):,}",
+                    flush=True,
+                )
+    finally:
+        for _, adata in studies:
             adata.file.close()
-        # Release cell-independent annotations (which AnnData may still load
-        # eagerly in backed mode) before opening the next large study.
-        del adata
+        # AnnData loads cell-independent annotations eagerly even in backed
+        # mode, so release all handles and metadata promptly after processing.
+        del studies
         gc.collect()
 
-        if common_genes is None:
-            common_genes = genes
-            highly_variable_count = study_hvgs.astype(np.int64)
-        else:
-            shared_mask = common_genes.isin(genes)
-            common_genes = common_genes[shared_mask]
-            highly_variable_count = highly_variable_count[shared_mask]
-            if len(common_genes) == 0:
-                raise ValueError("Input H5AD files have no genes in common")
-            positions = genes.get_indexer(common_genes)
-            highly_variable_count += study_hvgs[positions]
-
-        if verbose:
-            print(
-                "[variableGenesFromH5ADs] "
-                f"study_selected={int(study_hvgs.sum()):,}, "
-                f"shared_genes={len(common_genes):,}",
-                flush=True,
-            )
-
-    combined = highly_variable_count == len(paths)
-    result = common_genes[combined].tolist()
+    result = common_genes[highly_variable_in_all].tolist()
     if verbose:
         print(
             "[variableGenesFromH5ADs] complete: "
