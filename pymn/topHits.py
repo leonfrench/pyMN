@@ -30,7 +30,7 @@ def topHits(
         cnv = cell_nv.copy()
     if cell_nv is None:
         assert (
-            mn_key in adata.uns_keys()
+            mn_key in adata.uns
         ), "MetaNeighborUS resutls not stored in adata or passed as cell_nv"
         cnv = adata.uns[mn_key].copy()
 
