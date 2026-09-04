@@ -89,8 +89,6 @@ def topHits(
                                                  "target_cell_type":"Study_ID|Celltype_2",
                                                  "auroc": "Mean_AUROC", "is_reciprocal":"Match_type"})
     max_per_celltype_and_study.sort_values("Mean_AUROC", ascending=False, inplace=True)
-    #filter based on threshold (after averaging)
-    max_per_celltype_and_study.Mean_AUROC = np.round(max_per_celltype_and_study.Mean_AUROC, 2)
     if save_uns:
         adata.uns[f"{mn_key}_topHits"] = max_per_celltype_and_study
     else:
